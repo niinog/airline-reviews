@@ -1,0 +1,4 @@
+fastapi
+praw
+python-dotenv
+pandas
