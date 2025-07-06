@@ -2,6 +2,39 @@ import praw
 import time
 from dotenv import load_dotenv
 import os
+import re
+from bertopic import BERTopic
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+nltk.download('stopwords')
+nltk.download('wordnet')
+
+topic_model = BERTopic.load("../bertopic_model")
+
+topic_labels = {
+    -1: "General",
+     0: "Travel Booking",
+     1: "Compensation & Claims",
+     2: "Luggage & Boarding",
+     3: "Backpack & Personal Items",
+     4: "Flight Safety & Accidents",
+     5: "Politics & International Affairs"
+}
+
+# Preprocessing function
+lemmatizer = WordNetLemmatizer()
+extra_stopwords = set(["la","die","nu","cu","der","ca","pentru","und","das","sa","im","ive","dont","cant","wont","didnt"])
+stop_words = set(stopwords.words('english')).union(extra_stopwords)
+airline_names = ["easyjet", "ryanair", "turkish", "wizz", "air", "airways", "british","lufthansa","klm","delta","emirates","qatar","etihad","united","american","alitalia","airfrance","aeroflot"]
+
+def preprocess(text):
+    text = text.lower()
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'[^a-z\s]', '', text)
+    tokens = text.split()
+    tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in stop_words and word not in airline_names and len(word) > 2]
+    return ' '.join(tokens)
 
 load_dotenv()
 
@@ -62,7 +95,7 @@ def fetch_airline_posts(airline_name: str, total_limit: int = 1000, search_limit
                 )
             except Exception as e:
                 print(f"An error occurred with the API call: {e}")
-                time.sleep(5) # Wait before retrying or breaking
+                time.sleep(5) 
                 break
 
             posts_in_batch = 0
@@ -102,6 +135,18 @@ def fetch_airline_posts(airline_name: str, total_limit: int = 1000, search_limit
             time.sleep(1.5) # Be respectful to the API
 
     print(f"\nFinished fetching. Collected a total of {len(all_posts)} posts.")
+    texts = [p["title"] + " " + p["text"] + " " + " ".join(p["comments"]) for p in all_posts]
+    cleaned_texts = [preprocess(t) for t in texts]
+
+    topics, _ = topic_model.transform(cleaned_texts)
+    topic_labels_mapped = [topic_labels.get(t, "Unknown") for t in topics]
+
+    for post, clean, topic_num, topic_label in zip(all_posts, cleaned_texts, topics, topic_labels_mapped):
+        post["cleaned_text"] = clean
+        post["topic"] = int(topic_num)
+        post["topic_label"] = topic_label
+
+    print("Enrichment complete.")
     return all_posts
 
 
