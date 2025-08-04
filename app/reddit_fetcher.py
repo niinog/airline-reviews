@@ -1,40 +1,10 @@
-import praw
 import time
-from dotenv import load_dotenv
 import os
-import re
-from bertopic import BERTopic
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-nltk.download('stopwords')
-nltk.download('wordnet')
-
-topic_model = BERTopic.load("../bertopic_model")
-
-topic_labels = {
-    -1: "General",
-     0: "Travel Booking",
-     1: "Compensation & Claims",
-     2: "Luggage & Boarding",
-     3: "Backpack & Personal Items",
-     4: "Flight Safety & Accidents",
-     5: "Politics & International Affairs"
-}
-
-# Preprocessing function
-lemmatizer = WordNetLemmatizer()
-extra_stopwords = set(["la","die","nu","cu","der","ca","pentru","und","das","sa","im","ive","dont","cant","wont","didnt"])
-stop_words = set(stopwords.words('english')).union(extra_stopwords)
-airline_names = ["easyjet", "ryanair", "turkish", "wizz", "air", "airways", "british","lufthansa","klm","delta","emirates","qatar","etihad","united","american","alitalia","airfrance","aeroflot"]
-
-def preprocess(text):
-    text = text.lower()
-    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'[^a-z\s]', '', text)
-    tokens = text.split()
-    tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in stop_words and word not in airline_names and len(word) > 2]
-    return ' '.join(tokens)
+import praw
+from dotenv import load_dotenv
+from utils.preprocessing import preprocess
+from utils.reddit_utils import is_airline_post
+from utils.topic_model import get_topic_labels
 
 load_dotenv()
 
@@ -44,21 +14,7 @@ reddit = praw.Reddit(
     user_agent=os.getenv("REDDIT_USER_AGENT")
 )
 
-def is_airline_post(post, airline_name):
-    """Checks if a post is relevant to a specific airline."""
-    full_text = (post.title + " " + post.selftext).lower()
-    airline_name = airline_name.lower()
-    
-
-    if airline_name not in full_text:
-        return False
-
-    keywords = [
-        "flight", "airline", "plane", "delayed", "cancelled", "boarding",
-        "airport", "crew", "baggage", "ticket", "gate", "seat", "service"
-    ]
-    
-    return any(kw in full_text for kw in keywords)
+topic_model, topic_labels = get_topic_labels()
 
 
 def fetch_airline_posts(airline_name: str, total_limit: int = 1000, search_limit: int = 100):
