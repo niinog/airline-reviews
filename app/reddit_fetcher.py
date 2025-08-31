@@ -1,7 +1,10 @@
-import time
+# reddit_fetcher.py
 import os
 import praw
 from dotenv import load_dotenv
+from typing import List, Dict
+from diskcache import Cache
+
 from utils.preprocessing import preprocess
 from utils.reddit_utils import is_airline_post
 from utils.topic_model import get_topic_labels
@@ -11,98 +14,109 @@ load_dotenv()
 reddit = praw.Reddit(
     client_id=os.getenv("REDDIT_CLIENT_ID"),
     client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
-    user_agent=os.getenv("REDDIT_USER_AGENT")
+    user_agent=os.getenv("REDDIT_USER_AGENT"),
 )
+reddit.read_only = True
 
-topic_model, topic_labels = get_topic_labels()
+# persistent on-disk cache (works across app restarts if disk is persistent)
+cache = Cache("./cache_dir")
+CACHE_TOPIC_TTL = 24 * 3600  # 24h
 
+_topic_model = None
+_topic_labels = None
 
-def fetch_airline_posts(airline_name: str, total_limit: int = 1000, search_limit: int = 100):
+def _ensure_topic_model():
+    global _topic_model, _topic_labels
+    if _topic_model is None:
+        _topic_model, _topic_labels = get_topic_labels()
+
+def _assign_topics_inplace(posts: List[Dict]):
+    """Assign topics with per-post caching to avoid recomputing."""
+    _ensure_topic_model()
+
+    # Which posts still need a topic?
+    to_compute = []
+    cleaned_texts = []
+    idxs = []
+
+    for i, p in enumerate(posts):
+        pid = p["id"]
+        cached = cache.get(f"topic:{pid}")
+        if cached is not None:
+            topic_num = int(cached)
+            p["topic"] = topic_num
+            p["topic_label"] = _topic_labels.get(topic_num, "Unknown")
+            # optional: also cache cleaned_text if you need it later
+        else:
+            text = f'{p.get("title","")} {p.get("text","")}'
+            cleaned = preprocess(text)
+            to_compute.append(pid)
+            cleaned_texts.append(cleaned)
+            idxs.append(i)
+
+    if not to_compute:
+        return
+
+    topics, _ = _topic_model.transform(cleaned_texts)
+    for pid, i, topic_num in zip(to_compute, idxs, topics):
+        topic_num = int(topic_num)
+        posts[i]["topic"] = topic_num
+        posts[i]["topic_label"] = _topic_labels.get(topic_num, "Unknown")
+        cache.set(f"topic:{pid}", topic_num, expire=CACHE_TOPIC_TTL)
+
+def fetch_airline_posts(
+    airline_name: str,
+    total_limit: int = 200,
+    sort: str = "relevance",         # "new", "top", "relevance"
+    time_filter: str = "year",       # "hour","day","week","month","year","all"
+    include_comments: bool = False,  # fetch comments only on demand
+    with_topics: bool = False,       # compute topics for returned posts
+) -> List[Dict]:
     """
-    Fetches relevant airline posts from Reddit using multiple sort methods.
+    Fast path:
+    - one search call with a large limit (PRAW paginates internally)
+    - no comments by default (huge speedup)
+    - optional topic labeling with per-post caching
     """
-    all_posts = []
-    seen_post_ids = set() # Keep track of post IDs to avoid duplicates within this function
+    query = f'title:"{airline_name}" OR {airline_name}'
 
-    # Search across different sort methods to maximize results
-    sort_methods = ["new", "relevance", "top"]
-    
-    print(f"Starting fetch for '{airline_name}'. Goal: {total_limit} posts.")
+    selected: List[Dict] = []
+    seen = set()
 
-    for sort_method in sort_methods:
-        if len(all_posts) >= total_limit:
-            break # Stop if we've already reached our goal
+    # ask for more than you need because you'll filter with is_airline_post
+    raw_limit = min(total_limit * 3, 1000)
 
-        print(f"\n-- Searching with sort='{sort_method}' --")
-        last_post_fullname = None
+    for post in reddit.subreddit("all").search(
+        query, sort=sort, time_filter=time_filter, limit=raw_limit
+    ):
+        if post.id in seen:
+            continue
+        if not is_airline_post(post, airline_name):
+            continue
 
-        # This inner loop paginates for the current sort method
-        while len(all_posts) < total_limit:
-            params = {"after": last_post_fullname} if last_post_fullname else {}
-            
-            print(f"Collected {len(all_posts)}/{total_limit}. Fetching next batch...")
-            
-            try:
-                search_results = reddit.subreddit("all").search(
-                    airline_name,
-                    sort=sort_method,
-                    limit=search_limit,
-                    params=params
-                )
-            except Exception as e:
-                print(f"An error occurred with the API call: {e}")
-                time.sleep(5) 
-                break
+        seen.add(post.id)
 
-            posts_in_batch = 0
-            for post in search_results:
-                last_post_fullname = post.fullname
-                posts_in_batch += 1
+        top_comments = []
+        if include_comments:
+            # WARNING: this is slow; only use when the user opens a post
+            post.comments.replace_more(limit=0)
+            top_comments = [c.body for c in post.comments.list()[:5]]
 
-                # Avoid processing the same post twice if found via different sort methods
-                if post.id in seen_post_ids:
-                    continue
+        selected.append({
+            "id": post.id,
+            "title": post.title,
+            "text": post.selftext,
+            "created_utc": post.created_utc,
+            "score": post.score,
+            "url": post.url,
+            "num_comments": getattr(post, "num_comments", None),
+            "comments": top_comments,  # usually empty
+        })
 
-                if is_airline_post(post, airline_name):
-                    seen_post_ids.add(post.id)
-                    post.comments.replace_more(limit=0)
-                    top_comments = [
-                        comment.body for comment in post.comments.list()[:5]
-                    ]
+        if len(selected) >= total_limit:
+            break
 
-                    all_posts.append({
-                        "id": post.id,
-                        "title": post.title,
-                        "text": post.selftext,
-                        "created_utc": post.created_utc,
-                        "score": post.score,
-                        "url": post.url,
-                        "comments": top_comments
-                    })
+    if with_topics and selected:
+        _assign_topics_inplace(selected)
 
-                    if len(all_posts) >= total_limit:
-                        break
-            
-            # If a search yields no results, move to the next sort method
-            if posts_in_batch == 0:
-                print(f"No more posts found for sort='{sort_method}'.")
-                break
-            
-            time.sleep(1.5) # Be respectful to the API
-
-    print(f"\nFinished fetching. Collected a total of {len(all_posts)} posts.")
-    texts = [p["title"] + " " + p["text"] + " " + " ".join(p["comments"]) for p in all_posts]
-    cleaned_texts = [preprocess(t) for t in texts]
-
-    topics, _ = topic_model.transform(cleaned_texts)
-    topic_labels_mapped = [topic_labels.get(t, "Unknown") for t in topics]
-
-    for post, clean, topic_num, topic_label in zip(all_posts, cleaned_texts, topics, topic_labels_mapped):
-        post["cleaned_text"] = clean
-        post["topic"] = int(topic_num)
-        post["topic_label"] = topic_label
-
-    print("Enrichment complete.")
-    return all_posts
-
-
+    return selected
